@@ -28,13 +28,32 @@ def load_embedding_model():
 embedding_model = load_embedding_model()
 
 # Helper Functions
-def extract_text_from_pdf(pdf_file):
-    """Extract text from PDF file"""
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text()
-    return text
+def extract_text_from_pdf(uploaded_file):
+    """Extract text from a PDF safely, even if stream is unseekable or malformed."""
+    try:
+        # Ensure the file pointer is at start
+        uploaded_file.seek(0)
+        pdf_bytes = uploaded_file.read()
+
+        # Verify PDF header
+        if not pdf_bytes.startswith(b"%PDF"):
+            raise ValueError("File is not a valid PDF")
+
+        # Load into BytesIO for Pypdf2
+        pdf_stream = io.BytesIO(pdf_bytes)
+        pdf_reader = PyPDF2.PdfReader(pdf_stream)
+
+        text = ""
+        for page in pdf_reader.pages:
+            page_text = page.extract_text() or ""
+            text += page_text + "\n"
+        return text.strip()
+
+    except Exception as e:
+        return f"[Error extracting text: {str(e)}]"
+
+
+
 
 def chunk_text(text, chunk_size=500, overlap=50):
     """Split text into overlapping chunks"""
@@ -120,8 +139,7 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     # API Key input
-    api_key = st.text_input("Gemini API Key", type="password", 
-                            value=os.getenv("GEMINI_API_KEY", ""))
+    api_key = os.getenv("GEMINI_API_KEY")
     if api_key:
         genai.configure(api_key=api_key)
         st.success("API Key configured!")
