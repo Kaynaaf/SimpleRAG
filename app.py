@@ -55,7 +55,7 @@ def extract_text_from_pdf(uploaded_file):
 
 
 
-def chunk_text(text, chunk_size=500, overlap=50):
+def chunk_text(text, chunk_size=chunk_size_sb, overlap=50):
     """Split text into overlapping chunks"""
     words = text.split()
     chunks = []
@@ -95,7 +95,7 @@ def create_vector_store(documents):
     return index, embeddings
 
 
-def search_documents(query, top_k=3):
+def search_documents(query, top_k=top_k_sb):
     """Search for relevant document chunks"""
     if st.session_state.index is None or len(st.session_state.documents) == 0:
         return []
@@ -109,8 +109,8 @@ def search_documents(query, top_k=3):
         min(top_k, len(st.session_state.documents))
     )
     
-
-    similarity_threshold = 1.5  # Lower = more similar (L2 distance)
+    # Lower = more similar (L2 distance)
+    similarity_threshold = similarity_threshold_sb  # Set at sidebar
     
     results = []
     for idx, distance in zip(indices[0], distances[0]):
@@ -129,7 +129,7 @@ def generate_answer(query, context_docs):
     context = "\n\n".join([f"Source: {doc['source']}\n{doc['text']}" for doc in context_docs])
     
     # Create prompt
-    prompt = f"""You are a 140 IQ highly intelligent and helpful assistant. Answer the question based ONLY on the provided context.
+    prompt = f"""You are a 140 IQ, highly intelligent and, helpful assistant. Answer the question based ONLY on the provided context.
 If the context doesn't contain enough information, say so.
 
 Context:
@@ -196,7 +196,7 @@ with st.sidebar:
                         text = uploaded_file.read().decode('utf-8')
                     
                     # Chunk text
-                    chunks = chunk_text(text)
+                    chunks = chunk_text(text,chunk_size=chunk_size_sb)
                     
                     # Add to documents
                     for i, chunk in enumerate(chunks):
@@ -214,11 +214,11 @@ with st.sidebar:
     
     st.divider()
     st.header("🔍 Retrieval Settings")
-    top_k = st.slider("Number of sources to retrieve", 1, 10, 3)
-    similarity_threshold = st.slider("Similarity threshold", 0.0, 3.0, 1.5, 
+    top_k_sb = st.slider("Number of sources to retrieve", 1, 10, 3)
+    similarity_threshold_sb = st.slider("Similarity threshold", 0.0, 3.0, 1.5, 
                                      help="Lower = stricter matching")
     
-    chunk_size = st.number_input("Chunk size (words)", 100, 1000, 500)
+    chunk_size_sb = st.number_input("Chunk size (words)", 100, 1000, 500)
     st.divider()
     # Knowledge base info
     st.header("📊 Knowledge Base")
@@ -260,7 +260,7 @@ else:
             
             # Get relevant documents
             with st.spinner("Searching documents..."):
-                relevant_docs = search_documents(prompt, top_k=3)
+                relevant_docs = search_documents(prompt, top_k=top_k_sb)
             
             # Generate answer
             with st.spinner("Generating answer..."):
