@@ -94,6 +94,7 @@ def create_vector_store(documents):
     index.add(embeddings.astype("float32"))
     return index, embeddings
 
+
 def search_documents(query, top_k=3):
     """Search for relevant document chunks"""
     if st.session_state.index is None or len(st.session_state.documents) == 0:
@@ -108,14 +109,17 @@ def search_documents(query, top_k=3):
         min(top_k, len(st.session_state.documents))
     )
     
-    # Return results
+
+    similarity_threshold = 1.5  # Lower = more similar (L2 distance)
+    
     results = []
     for idx, distance in zip(indices[0], distances[0]):
-        results.append({
-            'text': st.session_state.documents[idx]['text'],
-            'source': st.session_state.documents[idx]['source'],
-            'score': float(distance)
-        })
+        if distance <= similarity_threshold:  # Only include relevant docs
+            results.append({
+                'text': st.session_state.documents[idx]['text'],
+                'source': st.session_state.documents[idx]['source'],
+                'score': float(distance)
+            })
     
     return results
 
@@ -152,10 +156,20 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     # API Key input
-    api_key = os.getenv("GEMINI_API_KEY")
-    if api_key:
+
+    custom_key = st.sidebar.toggle("Use custom Gemini keys or preconfigured. (default: custom)", value=True)
+    if custom_key:
+        api_key = st.sidebar.text_input(
+        "Enter your API key",
+        type="password"
+    )
+        genai.configure(api_key=api_key)
+        st.success("Custom API Key configured!")
+    elif not custom_key:
+        api_key = os.getenv("GEMINI_API_KEY")
         genai.configure(api_key=api_key)
         st.success("API Key configured!")
+
     else:
         st.warning("Please enter your Gemini API key")
     
@@ -199,7 +213,13 @@ with st.sidebar:
                 st.success(f"✅ Processed {len(uploaded_files)} files into {len(st.session_state.documents)} chunks!")
     
     st.divider()
+    st.header("🔍 Retrieval Settings")
+    top_k = st.slider("Number of sources to retrieve", 1, 10, 3)
+    similarity_threshold = st.slider("Similarity threshold", 0.0, 3.0, 1.5, 
+                                     help="Lower = stricter matching")
     
+    chunk_size = st.number_input("Chunk size (words)", 100, 1000, 500)
+    st.divider()
     # Knowledge base info
     st.header("📊 Knowledge Base")
     st.metric("Total Chunks", len(st.session_state.documents))
