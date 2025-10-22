@@ -65,20 +65,33 @@ def chunk_text(text, chunk_size=500, overlap=50):
             chunks.append(chunk)
     return chunks
 
+
 def create_vector_store(documents):
     """Create FAISS index from documents"""
     if not documents:
         return None, None
+
+    # Clean and validate text 
+    texts = []
+    for doc in documents:
+        t = doc.get("text")
+        if isinstance(t, str):
+            texts.append(t)
+        elif isinstance(t, (list, tuple)):
+            texts.append(" ".join(map(str, t)))
+        elif t is not None:
+            texts.append(str(t))
+
+    if not texts:
+        raise ValueError("No valid text found in documents")
+
     
-    # Generate embeddings
-    texts = [doc['text'] for doc in documents]
+
     embeddings = embedding_model.encode(texts, show_progress_bar=False)
-    
-    # Create FAISS index
     dimension = embeddings.shape[1]
+
     index = faiss.IndexFlatL2(dimension)
-    index.add(embeddings.astype('float32'))
-    
+    index.add(embeddings.astype("float32"))
     return index, embeddings
 
 def search_documents(query, top_k=3):
