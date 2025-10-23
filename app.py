@@ -6,6 +6,7 @@ import numpy as np
 import PyPDF2
 import io
 import os
+import re
 
 # Page config
 st.set_page_config(page_title="SimpleRAG", page_icon="🤖", layout="wide")
@@ -55,7 +56,7 @@ def chunk_text(text, chunk_size=500, overlap=50, mode="word"):
     
     if mode == "sentence":
         # Sentence-aware chunking
-        import re
+        
         sentences = re.split(r'[.!?]+\s+', text)
         
         chunks = []
@@ -204,7 +205,7 @@ with st.sidebar:
     st.header("⚙️ Configuration")
     
     # API Key input
-    custom_key = st.toggle("Use custom Gemini keys", value=True)
+    custom_key = st.toggle("Use custom Gemini key", value=True)
     if custom_key:
         api_key = st.text_input("Enter your API key", type="password")
         if api_key:
@@ -222,7 +223,7 @@ with st.sidebar:
     st.divider()
     
     # RAG Behavior Settings
-    st.header("🔍 RAG Settings")
+    st.header("🔍 Cknfigure RAG behaviour")
     
     # Retrieval settings
     top_k = st.slider(
