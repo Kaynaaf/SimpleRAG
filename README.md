@@ -38,11 +38,6 @@ graph LR
     I --> J[Gemini API]
     J --> K[Answer + Sources]
     
-    style A fill:#e1f5ff
-    style E fill:#fff4e1
-    style J fill:#ffe1f5
-    style K fill:#e1ffe1
-
 ```
 
 ### Core Components
