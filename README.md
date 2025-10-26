@@ -1,5 +1,8 @@
 # SimpleRAG
+
 [Link to Demo](https://simple-rag-app.streamlit.app/)
+
+
 A straightforward Retrieval-Augmented Generation (RAG) system deployed with Streamlit that lets you upload documents and ask questions about their content. Uses Google's Gemini API for generation, Sentence Transformers for embeddings, and FAISS for vector search.
 
 ## What It Does
