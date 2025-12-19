@@ -54,7 +54,7 @@ graph TD
     G --> H[FAISS Search: K-Nearest Children]
     H --> I[Map Children to Parents]
     I --> J[Cross-Encoder Reranker]
-    J --> K[Gemini 1.5 Flash]
+    J --> K[Gemini 2.5 Flash]
     D -.-> K
     K --> L[Streaming Response + Citations]
 ```
