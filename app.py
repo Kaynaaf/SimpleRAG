@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from markitdown import MarkItDown
 from sentence_transformers import SentenceTransformer, CrossEncoder
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 
 @dataclass
@@ -42,7 +43,7 @@ class RAGState:
     metadata_store: List[ChunkMetadata] = field(default_factory=list)
     embedder: Optional[SentenceTransformer] = None
     reranker: Optional[CrossEncoder] = None
-    gemini_model: Optional[genai.GenerativeModel] = None
+    gemini_model: Optional[genai.Client] = None
     ingested_files: List[str] = field(default_factory=list)
 
 @dataclass
@@ -181,13 +182,15 @@ class Retriever:
         
         return reranked[:top_k]
 
-def generate_response(query: str, contexts: List[RerankedResult], model: genai.GenerativeModel) -> str:
+def generate_response_stream(query: str, contexts: List[RerankedResult], client: genai.Client):
     """
-    Generate response using Gemini with retrieved parent contexts.
+    Generate streaming response using Gemini with retrieved parent contexts.
     Leverages parent-child chunking by using full parent contexts for generation.
+    Yields text chunks as they arrive.
     """
     if not contexts:
-        return "I don't have enough information in the uploaded documents to answer that question. Please upload relevant documents first."
+        yield "I don't have enough information in the uploaded documents to answer that question. Please upload relevant documents first."
+        return
     
     # Build context string with source attribution
     context_parts = []
@@ -214,33 +217,39 @@ QUESTION: {query}
 ANSWER:"""
 
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        response = client.models.generate_content_stream(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
+                
     except Exception as e:
-        return f"Error generating response: {str(e)}"
+        yield f"Error generating response: {str(e)}"
 
 @st.cache_resource
 def get_models(gemini_api_key: str = None):
     embedder = SentenceTransformer('all-MiniLM-L6-v2')
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     
-    gemini_model = None
+    gemini_client = None
     if gemini_api_key:
-        genai.configure(api_key=gemini_api_key)
-        gemini_model = genai.GenerativeModel('gemini-pro')
+        gemini_client = genai.Client(api_key=gemini_api_key)
     
-    return embedder, reranker, gemini_model
+    return embedder, reranker, gemini_client
 
 def initialize_state():
     if 'rag_state' not in st.session_state:
         # Get API key from secrets or environment
         gemini_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
         
-        embedder, reranker, gemini_model = get_models(gemini_key)
+        embedder, reranker, gemini_client = get_models(gemini_key)
         st.session_state.rag_state = RAGState(
             embedder=embedder,
             reranker=reranker,
-            gemini_model=gemini_model,
+            gemini_model=gemini_client,
             faiss_index=faiss.IndexFlatIP(384)
         )
     
@@ -296,7 +305,7 @@ def clear_all_chunks():
     st.session_state.chat_history = []
 
 def main():
-    st.set_page_config(page_title="RAG Chatbot", layout="wide", page_icon="🤖")
+    st.set_page_config(page_title="NanoRAG", layout="wide", page_icon="🧠")
     
     initialize_state()
 
@@ -309,8 +318,8 @@ def main():
             st.warning("⚠️ Gemini API key not configured")
             api_key = st.text_input("Enter Gemini API Key", type="password")
             if api_key and st.button("Set API Key"):
-                embedder, reranker, gemini_model = get_models(api_key)
-                st.session_state.rag_state.gemini_model = gemini_model
+                embedder, reranker, gemini_client = get_models(api_key)
+                st.session_state.rag_state.gemini_model = gemini_client
                 st.session_state.api_key_set = True
                 st.rerun()
         else:
@@ -371,7 +380,7 @@ def main():
             st.rerun()
 
     # Main Chat Interface
-    st.title("🤖 RAG Chatbot")
+    st.title("NanoRAG")
     st.caption("Ask questions about your uploaded documents")
     
     # Check if system is ready
@@ -426,9 +435,16 @@ def main():
                             for r in candidates[:top_k]
                         ]
                 
-                with st.spinner("💭 Generating response..."):
-                    response = generate_response(query, contexts, st.session_state.rag_state.gemini_model)
-                    st.markdown(response)
+                # Stream the response
+                response_placeholder = st.empty()
+                full_response = ""
+                
+                for chunk in generate_response_stream(query, contexts, st.session_state.rag_state.gemini_model):
+                    full_response += chunk
+                    response_placeholder.markdown(full_response + "▌")
+                
+                response_placeholder.markdown(full_response)
+                response = full_response
                 
                 # Show sources
                 if contexts:
