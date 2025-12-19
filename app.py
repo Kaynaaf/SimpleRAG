@@ -199,13 +199,15 @@ def generate_response_stream(query: str, contexts: List[RerankedResult], client:
     
     context_string = "\n---\n".join(context_parts)
     
-    # Create prompt that emphasizes using the parent contexts
+    # Create prompt that emphasizes using the parent contexts with proper citation format
     prompt = f"""You are a helpful assistant answering questions based on provided document contexts.
 
 IMPORTANT INSTRUCTIONS:
 - Answer the question using ONLY the information from the contexts below
 - If the contexts don't contain enough information to answer fully, say so
-- Cite which context(s) you used (e.g., "According to Context 1..." or "Based on the document...")
+- ALWAYS cite your sources using square brackets with numbers [1], [2], [3], etc. immediately after the relevant statement
+- Use the context number that corresponds to where you found the information
+- You can cite multiple sources like [1][2] if information comes from multiple contexts
 - Be specific and detailed in your answer
 - If multiple contexts provide relevant information, synthesize them coherently
 
@@ -214,7 +216,7 @@ CONTEXTS:
 
 QUESTION: {query}
 
-ANSWER:"""
+ANSWER (remember to cite sources with [1], [2], etc.):"""
 
     try:
         response = client.models.generate_content_stream(
@@ -394,11 +396,14 @@ def main():
     for message in st.session_state.chat_history:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            if "sources" in message:
-                with st.expander("📚 View Sources"):
+            if "sources" in message and message["sources"]:
+                with st.expander("📚 Sources"):
                     for i, src in enumerate(message["sources"], 1):
-                        st.markdown(f"**Source {i}** ({src['file']}):")
-                        st.text(src['text'][:300] + "...")
+                        st.markdown(f"**[{i}] {src['file']}**")
+                        preview = src['text'][:400] + "..." if len(src['text']) > 400 else src['text']
+                        st.text(preview)
+                        if i < len(message["sources"]):
+                            st.markdown("---")
 
     # Chat input
     if query := st.chat_input("Ask a question about your documents..."):
@@ -446,14 +451,16 @@ def main():
                 response_placeholder.markdown(full_response)
                 response = full_response
                 
-                # Show sources
+                # Show sources at the bottom
                 if contexts:
-                    with st.expander("📚 View Sources"):
+                    with st.expander("📚 Sources"):
                         for i, ctx in enumerate(contexts, 1):
                             score_text = f"Rerank: {ctx.rerank_score:.3f}" if use_reranking else f"Score: {ctx.retrieval_score:.3f}"
-                            st.markdown(f"**Source {i}** ({ctx.source_file}) - {score_text}")
-                            st.text(ctx.parent_text[:400] + "..." if len(ctx.parent_text) > 400 else ctx.parent_text)
-                            st.markdown("---")
+                            st.markdown(f"**[{i}] {ctx.source_file}** ({score_text})")
+                            preview = ctx.parent_text[:400] + "..." if len(ctx.parent_text) > 400 else ctx.parent_text
+                            st.text(preview)
+                            if i < len(contexts):
+                                st.markdown("---")
                     
                     # Store sources with message
                     sources = [{"file": ctx.source_file, "text": ctx.parent_text} for ctx in contexts]
