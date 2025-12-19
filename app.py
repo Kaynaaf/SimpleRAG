@@ -8,57 +8,54 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from markitdown import MarkItDown
 from sentence_transformers import SentenceTransformer, CrossEncoder
+import google.generativeai as genai
 
 
 @dataclass
 class ChunkMetadata:
-    
     child_id: str
     parent_id: str
     child_text: str
+    source_file: str  # Track which file the chunk came from
 
 @dataclass
 class RetrievalResult:
-   
     parent_text: str
     parent_id: str
     score: float
     child_matched: str
+    source_file: str
 
 @dataclass
 class RerankedResult:
-    
     parent_text: str
     parent_id: str
     retrieval_score: float
     rerank_score: float
     child_matched: str
+    source_file: str
 
 @dataclass
 class RAGState:
-    
     faiss_index: Optional[faiss.IndexFlatIP] = None
     doc_store: Dict[str, str] = field(default_factory=dict)
     metadata_store: List[ChunkMetadata] = field(default_factory=list)
     embedder: Optional[SentenceTransformer] = None
     reranker: Optional[CrossEncoder] = None
+    gemini_model: Optional[genai.GenerativeModel] = None
+    ingested_files: List[str] = field(default_factory=list)
 
 @dataclass
 class SplitterConfig:
-    
     parent_size: int = 2000
     child_size: int = 400
     overlap: int = 50
 
-# Implemented Parent-child chunk splitting from scratch
-
 @dataclass
 class ParentChildSplitter:
-    
     config: SplitterConfig = field(default_factory=SplitterConfig)
 
     def _split_text(self, text: str, size: int) -> List[str]:
-        
         if len(text) <= size:
             return [text]
         
@@ -69,7 +66,6 @@ class ParentChildSplitter:
         while start < text_len:
             end = min(start + size, text_len)
             
-            
             if end < text_len:
                 lookback = text.rfind(' ', start, end)
                 if lookback != -1 and lookback > start:
@@ -78,13 +74,12 @@ class ParentChildSplitter:
             chunks.append(text[start:end].strip())
             start += size - self.config.overlap
             
-           
             if start >= end: 
                 start = end
                 
         return chunks
 
-    def split_document(self, raw_text: str) -> Tuple[List[str], List[ChunkMetadata], Dict[str, str]]:
+    def split_document(self, raw_text: str, source_file: str) -> Tuple[List[str], List[ChunkMetadata], Dict[str, str]]:
         """
         Splits doc into Parents -> Children.
         Returns:
@@ -99,11 +94,9 @@ class ParentChildSplitter:
         parent_storage = {}
 
         for parent_text in parents:
-            # Generate Parent ID
             p_id = str(uuid.uuid4())[:8]
             parent_storage[p_id] = parent_text
             
-            # Create Children from this Parent
             children = self._split_text(parent_text, self.config.child_size)
             
             for child_text in children:
@@ -113,31 +106,26 @@ class ParentChildSplitter:
                 metadata_list.append(ChunkMetadata(
                     child_id=c_id,
                     parent_id=p_id,
-                    child_text=child_text
+                    child_text=child_text,
+                    source_file=source_file
                 ))
 
         return child_texts_for_embedding, metadata_list, parent_storage
 
-# Retrieve Chunks and Rerank them
-
 @dataclass
 class Retriever:
-    
     state: RAGState
     
     def retrieve_candidates(self, query: str, top_k: int = 5, candidate_multiplier: int = 3) -> List[RetrievalResult]:
-     
         if self.state.faiss_index is None or self.state.faiss_index.ntotal == 0:
             return []
 
-        # Embed Query
         q_embed = self.state.embedder.encode([query]).astype('float32')
         faiss.normalize_L2(q_embed)
-        # Search FAISS for more candidates than needed
+        
         num_candidates = min(top_k * candidate_multiplier, self.state.faiss_index.ntotal)
         distances, indices = self.state.faiss_index.search(q_embed, num_candidates)
         
-        # Map back to Parents with deduplication
         unique_parent_ids = set()
         results = []
 
@@ -148,41 +136,36 @@ class Retriever:
             meta = self.state.metadata_store[idx]
             p_id = meta.parent_id
             
-            # Deduplication logic
             if p_id not in unique_parent_ids:
                 parent_content = self.state.doc_store.get(p_id, "")
                 results.append(RetrievalResult(
                     parent_text=parent_content,
                     parent_id=p_id,
                     score=float(dist),
-                    child_matched=meta.child_text
+                    child_matched=meta.child_text,
+                    source_file=meta.source_file
                 ))
                 unique_parent_ids.add(p_id)
             
         return results
     
     def rerank_results(self, query: str, results: List[RetrievalResult], top_k: int = 5) -> List[RerankedResult]:
-       
         if not results or self.state.reranker is None:
-            # Fallback: convert to reranked format without reranking
             return [
                 RerankedResult(
                     parent_text=r.parent_text,
                     parent_id=r.parent_id,
                     retrieval_score=r.score,
                     rerank_score=0.0,
-                    child_matched=r.child_matched
+                    child_matched=r.child_matched,
+                    source_file=r.source_file
                 )
                 for r in results[:top_k]
             ]
         
-        # Prepare query-document pairs for cross-encoder
         pairs = [[query, r.parent_text] for r in results]
-        
-        
         rerank_scores = self.state.reranker.predict(pairs)
         
-     
         reranked = []
         for result, rerank_score in zip(results, rerank_scores):
             reranked.append(RerankedResult(
@@ -190,56 +173,103 @@ class Retriever:
                 parent_id=result.parent_id,
                 retrieval_score=result.score,
                 rerank_score=float(rerank_score),
-                child_matched=result.child_matched
+                child_matched=result.child_matched,
+                source_file=result.source_file
             ))
-        
         
         reranked.sort(key=lambda x: x.rerank_score, reverse=True)
         
         return reranked[:top_k]
 
+def generate_response(query: str, contexts: List[RerankedResult], model: genai.GenerativeModel) -> str:
+    """
+    Generate response using Gemini with retrieved parent contexts.
+    Leverages parent-child chunking by using full parent contexts for generation.
+    """
+    if not contexts:
+        return "I don't have enough information in the uploaded documents to answer that question. Please upload relevant documents first."
+    
+    # Build context string with source attribution
+    context_parts = []
+    for i, ctx in enumerate(contexts, 1):
+        context_parts.append(f"[Context {i} from {ctx.source_file}]:\n{ctx.parent_text}\n")
+    
+    context_string = "\n---\n".join(context_parts)
+    
+    # Create prompt that emphasizes using the parent contexts
+    prompt = f"""You are a helpful assistant answering questions based on provided document contexts.
 
+IMPORTANT INSTRUCTIONS:
+- Answer the question using ONLY the information from the contexts below
+- If the contexts don't contain enough information to answer fully, say so
+- Cite which context(s) you used (e.g., "According to Context 1..." or "Based on the document...")
+- Be specific and detailed in your answer
+- If multiple contexts provide relevant information, synthesize them coherently
+
+CONTEXTS:
+{context_string}
+
+QUESTION: {query}
+
+ANSWER:"""
+
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error generating response: {str(e)}"
 
 @st.cache_resource
-def get_models():
-    
+def get_models(gemini_api_key: str = None):
     embedder = SentenceTransformer('all-MiniLM-L6-v2')
-    
     reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    return embedder, reranker
+    
+    gemini_model = None
+    if gemini_api_key:
+        genai.configure(api_key=gemini_api_key)
+        gemini_model = genai.GenerativeModel('gemini-pro')
+    
+    return embedder, reranker, gemini_model
 
 def initialize_state():
     if 'rag_state' not in st.session_state:
-        embedder, reranker = get_models()
+        # Get API key from secrets or environment
+        gemini_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY"))
+        
+        embedder, reranker, gemini_model = get_models(gemini_key)
         st.session_state.rag_state = RAGState(
             embedder=embedder,
             reranker=reranker,
+            gemini_model=gemini_model,
             faiss_index=faiss.IndexFlatIP(384)
-            
         )
+    
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    
+    if 'api_key_set' not in st.session_state:
+        st.session_state.api_key_set = False
 
 def ingest_file(uploaded_file):
     """Orchestrates: Upload -> MarkItDown -> Split -> Embed -> Store"""
     md = MarkItDown()
-    
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp:
         tmp.write(uploaded_file.getvalue())
         tmp_path = tmp.name
 
     try:
-        # Convert to Markdown
         result = md.convert(tmp_path)
         text_content = result.text_content
     except Exception as e:
-        st.error(f"Error processing file: {e}")
+        st.error(f"Error processing file {uploaded_file.name}: {e}")
         return 0
     finally:
         os.remove(tmp_path)
 
     # Split (Parent-Child)
     splitter = ParentChildSplitter()
-    child_texts, metadata, parent_map = splitter.split_document(text_content)
+    child_texts, metadata, parent_map = splitter.split_document(text_content, uploaded_file.name)
     
     if not child_texts:
         return 0
@@ -253,84 +283,171 @@ def ingest_file(uploaded_file):
     st.session_state.rag_state.faiss_index.add(embeddings)
     st.session_state.rag_state.metadata_store.extend(metadata)
     st.session_state.rag_state.doc_store.update(parent_map)
+    st.session_state.rag_state.ingested_files.append(uploaded_file.name)
     
     return len(child_texts)
 
-# Streamlit UI
+def clear_all_chunks():
+    """Clear all stored data and reset the system"""
+    st.session_state.rag_state.faiss_index = faiss.IndexFlatIP(384)
+    st.session_state.rag_state.doc_store = {}
+    st.session_state.rag_state.metadata_store = []
+    st.session_state.rag_state.ingested_files = []
+    st.session_state.chat_history = []
 
 def main():
-    st.set_page_config(layout="wide")
-    st.title("🧩 Parent-Child RAG with Cross-Encoder Reranking")
+    st.set_page_config(page_title="RAG Chatbot", layout="wide", page_icon="🤖")
+    
     initialize_state()
 
+    # Sidebar
     with st.sidebar:
-        st.header("1. Ingestion")
-        uploaded = st.file_uploader("Upload Document", type=['pdf', 'docx', 'txt', 'pptx'])
-        if uploaded and st.button("Ingest File"):
-            with st.spinner("🔄 Converting & indexing..."):
-                count = ingest_file(uploaded)
-            st.success(f"✅ Indexed {count} child chunks!")
-            
-        st.markdown("---")
-        st.header("⚙️ Retrieval Settings")
-        top_k = st.slider("Top Results", 1, 10, 3)
-        use_reranking = st.checkbox("Enable Cross-Encoder Reranking", value=True)
-        candidate_multiplier = st.slider("Candidate Multiplier", 2, 5, 3, 
-                                        help="Retrieve N×top_k candidates for reranking")
+        st.title("📚 Document Manager")
+        
+        # API Key Input
+        if not st.session_state.api_key_set:
+            st.warning("⚠️ Gemini API key not configured")
+            api_key = st.text_input("Enter Gemini API Key", type="password")
+            if api_key and st.button("Set API Key"):
+                embedder, reranker, gemini_model = get_models(api_key)
+                st.session_state.rag_state.gemini_model = gemini_model
+                st.session_state.api_key_set = True
+                st.rerun()
+        else:
+            st.success("✅ Gemini API configured")
         
         st.markdown("---")
-        st.header("📊 Debug Stats")
+        
+        # File Upload Section
+        st.header("📤 Upload Documents")
+        uploaded_files = st.file_uploader(
+            "Upload one or more documents",
+            type=['pdf', 'docx', 'txt', 'pptx'],
+            accept_multiple_files=True
+        )
+        
+        if uploaded_files and st.button("📥 Ingest Files", type="primary"):
+            total_chunks = 0
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, uploaded_file in enumerate(uploaded_files):
+                status_text.text(f"Processing {uploaded_file.name}...")
+                chunks = ingest_file(uploaded_file)
+                total_chunks += chunks
+                progress_bar.progress((i + 1) / len(uploaded_files))
+            
+            status_text.empty()
+            progress_bar.empty()
+            st.success(f"✅ Ingested {len(uploaded_files)} file(s) with {total_chunks} chunks!")
+            st.rerun()
+        
+        st.markdown("---")
+        
+        # Settings
+        st.header("⚙️ Settings")
+        top_k = st.slider("Retrieved Contexts", 1, 10, 3)
+        use_reranking = st.checkbox("Enable Reranking", value=True)
+        
+        st.markdown("---")
+        
+        # Stats
+        st.header("📊 Statistics")
         if st.session_state.rag_state.faiss_index:
-            st.metric("Total Child Chunks (FAISS)", st.session_state.rag_state.faiss_index.ntotal)
-            st.metric("Total Parent Docs (Storage)", len(st.session_state.rag_state.doc_store))
+            st.metric("Child Chunks", st.session_state.rag_state.faiss_index.ntotal)
+            st.metric("Parent Docs", len(st.session_state.rag_state.doc_store))
+            st.metric("Files Ingested", len(st.session_state.rag_state.ingested_files))
+            
+            if st.session_state.rag_state.ingested_files:
+                with st.expander("📁 Ingested Files"):
+                    for f in st.session_state.rag_state.ingested_files:
+                        st.text(f"• {f}")
+        
+        # Clear button at bottom
+        st.markdown("---")
+        if st.button("🗑️ Clear All Chunks", type="secondary", use_container_width=True):
+            clear_all_chunks()
+            st.success("✅ All chunks cleared!")
+            st.rerun()
 
     # Main Chat Interface
-    st.subheader("2. Query System")
-    query = st.text_input("Ask a question about your documents:")
+    st.title("🤖 RAG Chatbot")
+    st.caption("Ask questions about your uploaded documents")
     
-    if query:
-        retriever = Retriever(state=st.session_state.rag_state)
+    # Check if system is ready
+    if st.session_state.rag_state.faiss_index.ntotal == 0:
+        st.info("👈 Please upload documents in the sidebar to get started!")
+    
+    if not st.session_state.api_key_set:
+        st.warning("⚠️ Please configure your Gemini API key in the sidebar")
+    
+    # Display chat history
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if "sources" in message:
+                with st.expander("📚 View Sources"):
+                    for i, src in enumerate(message["sources"], 1):
+                        st.markdown(f"**Source {i}** ({src['file']}):")
+                        st.text(src['text'][:300] + "...")
+
+    # Chat input
+    if query := st.chat_input("Ask a question about your documents..."):
+        # Add user message to chat
+        st.session_state.chat_history.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
         
-        # Step 1: Retrieve candidates
-        with st.spinner("🔍 Retrieving candidates..."):
-            candidates = retriever.retrieve_candidates(query, top_k=top_k, candidate_multiplier=candidate_multiplier)
-        
-        if not candidates:
-            st.warning("No relevant context found.")
-        else:
-            # Step 2: Rerank if enabled
-            if use_reranking:
-                with st.spinner("🎯 Reranking with cross-encoder..."):
-                    results = retriever.rerank_results(query, candidates, top_k=top_k)
-                st.info(f"Found {len(candidates)} candidates → Reranked to top {len(results)} contexts")
+        # Generate response
+        with st.chat_message("assistant"):
+            if st.session_state.rag_state.faiss_index.ntotal == 0:
+                response = "Please upload documents first before asking questions."
+                st.markdown(response)
+            elif not st.session_state.api_key_set:
+                response = "Please configure your Gemini API key in the sidebar."
+                st.markdown(response)
             else:
-                # Convert to reranked format without reranking
-                results = [
-                    RerankedResult(
-                        parent_text=r.parent_text,
-                        parent_id=r.parent_id,
-                        retrieval_score=r.score,
-                        rerank_score=0.0,
-                        child_matched=r.child_matched
-                    )
-                    for r in candidates[:top_k]
-                ]
-                st.info(f"Found {len(results)} contexts (reranking disabled)")
-            
-            # Display results
-            for i, res in enumerate(results):
-                score_display = f"Rerank: {res.rerank_score:.4f} | Retrieval: {res.retrieval_score:.4f}" if use_reranking else f"Score: {res.retrieval_score:.4f}"
+                with st.spinner("🔍 Searching documents..."):
+                    retriever = Retriever(state=st.session_state.rag_state)
+                    candidates = retriever.retrieve_candidates(query, top_k=top_k, candidate_multiplier=3)
+                    
+                    if use_reranking and candidates:
+                        contexts = retriever.rerank_results(query, candidates, top_k=top_k)
+                    else:
+                        contexts = [
+                            RerankedResult(
+                                parent_text=r.parent_text,
+                                parent_id=r.parent_id,
+                                retrieval_score=r.score,
+                                rerank_score=0.0,
+                                child_matched=r.child_matched,
+                                source_file=r.source_file
+                            )
+                            for r in candidates[:top_k]
+                        ]
                 
-                with st.expander(f"Context #{i+1} ({score_display})", expanded=i==0):
-                    col1, col2 = st.columns([1, 2])
+                with st.spinner("💭 Generating response..."):
+                    response = generate_response(query, contexts, st.session_state.rag_state.gemini_model)
+                    st.markdown(response)
+                
+                # Show sources
+                if contexts:
+                    with st.expander("📚 View Sources"):
+                        for i, ctx in enumerate(contexts, 1):
+                            score_text = f"Rerank: {ctx.rerank_score:.3f}" if use_reranking else f"Score: {ctx.retrieval_score:.3f}"
+                            st.markdown(f"**Source {i}** ({ctx.source_file}) - {score_text}")
+                            st.text(ctx.parent_text[:400] + "..." if len(ctx.parent_text) > 400 else ctx.parent_text)
+                            st.markdown("---")
                     
-                    with col1:
-                        st.markdown("#### 🎯 Matched Fragment (Child)")
-                        st.code(res.child_matched, language="text")
-                    
-                    with col2:
-                        st.markdown("#### 📖 Full Context (Parent)")
-                        st.markdown(res.parent_text)
+                    # Store sources with message
+                    sources = [{"file": ctx.source_file, "text": ctx.parent_text} for ctx in contexts]
+                    st.session_state.chat_history.append({
+                        "role": "assistant",
+                        "content": response,
+                        "sources": sources
+                    })
+                else:
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
 
 if __name__ == "__main__":
     main()
